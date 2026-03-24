@@ -34,11 +34,38 @@ class IPlannerAgent():
         if math.hypot(self.sensor_offset_x, self.sensor_offset_y) > 1e-1:
             self.is_traj_shift = True
         self.net = PlannerNet(encoder_channel=16)
-        try:
-            model_state_dict, _ = torch.load(model_path, weights_only=True)
-        except ValueError:
-            model_state_dict = torch.load(model_path, weights_only=True)
-        self.net.load_state_dict(model_state_dict, strict=True)
+        torch.serialization.add_safe_globals([PlannerNet])
+        # try:
+        #     model_state_dict, _ = torch.load(model_path, weights_only=False)
+        # except ValueError:
+        #     model_state_dict = torch.load(model_path, weights_only=False)
+        # self.net.load_state_dict(model_state_dict, strict=True)
+        ckpt = torch.load(model_path, weights_only=False)
+
+        # Caso: checkpoint é tupla (seu caso)
+        if isinstance(ckpt, tuple):
+            model = ckpt[0]
+
+        # Caso: checkpoint é modelo direto
+        elif isinstance(ckpt, PlannerNet):
+            model = ckpt
+
+        # Caso: checkpoint é dict
+        elif isinstance(ckpt, dict):
+            if "state_dict" in ckpt:
+                self.net.load_state_dict(ckpt["state_dict"], strict=True)
+                model = self.net
+            else:
+                self.net.load_state_dict(ckpt, strict=True)
+                model = self.net
+
+        else:
+            raise ValueError(f"Formato desconhecido: {type(ckpt)}")
+
+        # Se veio modelo completo, usa direto
+        if isinstance(model, PlannerNet):
+            self.net = model
+            
         self.net.eval()
         if torch.cuda.is_available():
             self.net = self.net.cuda()

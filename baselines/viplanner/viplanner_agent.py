@@ -45,9 +45,9 @@ class VIPlannerAgent():
         else:
             self.net = AutoEncoder(self.train_config.in_channel, self.train_config.knodes)
         try:
-            model_state_dict, _ = torch.load(model_path, weights_only=True)
+            model_state_dict, _ = torch.load(model_path, map_location='cpu', weights_only=False)
         except ValueError:
-            model_state_dict = torch.load(model_path, weights_only=True)
+            model_state_dict = torch.load(model_path, map_location='cpu', weights_only=False)
         self.net.load_state_dict(model_state_dict, strict=True)
         self.net.eval()
         self.net.to(self.device)

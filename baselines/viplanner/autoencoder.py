@@ -12,7 +12,7 @@ import torch.nn as nn
 from configs.learning_config import TrainCfg
 
 # visual-imperative-planner
-from plannernet import PlannerNet
+from planner_net import PlannerNet
 from rgb_encoder import PRE_TRAIN_POSSIBLE, RGBEncoder
 
 
