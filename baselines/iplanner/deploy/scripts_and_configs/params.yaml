@@ -1,0 +1,4 @@
+wrapper_iplanner:
+  intrinsic: [0.0, 0.0, 0.0]
+  checkpoint: "./precisa_setar_o_checkpoint"
+  config: "./scripts_and_configs/iplanner.yaml"
