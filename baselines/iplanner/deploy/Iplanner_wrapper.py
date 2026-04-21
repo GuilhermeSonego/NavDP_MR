@@ -8,6 +8,10 @@ from tracking_utils import MPC_Controller
 from my_interfaces.msg import DepthGoal # Tem que colocar a mensagem nova aqui
 from std_msgs.msg import Float32MultiArray
 from geometry_msgs.msg import Twist
+from scipy.spatial.transform import Rotation as R
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2 as pc2
 
 from cv_bridge import CvBridge
 import numpy as np
@@ -27,17 +31,22 @@ class PlannerNode(Node):
         super().__init__('planner_node')
 
         self.declare_parameter('intrinsic', [0.0, 0.0])
-        self.declare_parameter('checkpoint', [0.0])
-        self.declare_parameter('config', [0.0])
+        self.declare_parameter('checkpoint', '')
+        self.declare_parameter('config', '')
         self.declare_parameter('speed', 0.0)
         self.declare_parameter('goal_range', 0.0)
         self.declare_parameter('controller_frequency', 30.0)
+        self.declare_parameter('depth_height', 0)
+        self.declare_parameter('depth_width', 0)
 
-        intrinsic = np.array(self.get_parameter('intrinsic').get_parameter_value().double_value)
-        checkpoint = np.array(self.get_parameter('checkpoint').get_parameter_value().string_value)
-        config = np.array(self.get_parameter('config').get_parameter_value().string_value)
+        self.intrinsic = np.array(self.get_parameter('intrinsic').get_parameter_value().double_array_value)
+        checkpoint = self.get_parameter('checkpoint').get_parameter_value().string_value
+        config = self.get_parameter('config').get_parameter_value().string_value
 
-        self.planner = IPlannerAgent(intrinsic,
+        self.depth_height = self.get_parameter('depth_height').get_parameter_value().integer_value
+        self.depth_width = self.get_parameter('depth_width').get_parameter_value().integer_value
+
+        self.planner = IPlannerAgent(self.intrinsic,
                                     model_path=checkpoint,
                                     model_config_path=config,
                                     device='cuda:0')
@@ -45,19 +54,38 @@ class PlannerNode(Node):
         self.bridge = CvBridge()
         self.mutex_planner = threading.Lock() # Planner trajectory mutex
         self.mutex_odom = threading.Lock() # Odometry value mutex
+        self.mutex_pointcloud = threading.Lock() # Pointcloud mutex
         self.freq_controller = self.get_parameter('controller_frequency').get_parameter_value().double_value # Maximum controller frequency in hz
         self.planner_group = MutuallyExclusiveCallbackGroup()
         self.odometry_group = MutuallyExclusiveCallbackGroup()
+        self.pointcloud_group = MutuallyExclusiveCallbackGroup()
 
         self.planning_output = PlanningOutput()
         self.mpc = None
         self.current_odom = None
+        self.current_pointcloud = None
         self.goal_range = self.get_parameter('goal_range').get_parameter_value().double_value
         self.speed = self.get_parameter('speed').get_parameter_value().double_value
 
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            '/local_position/odom',
+            self.update_odometry,
+            1,
+            callback_group=self.odometry_group
+        )
+
+        self.pointcloud_sub = self.create_subscription(
+            PointCloud2,
+            '/pointcloud',
+            self.update_pointcloud,
+            1,
+            callback_group = self.pointcloud_group
+        )
+
         self.planner_sub = self.create_subscription(
             DepthGoal,
-            '/iplanner_input',
+            '/planner_input',
             self.planning,
             1,
             callback_group=self.planner_group
@@ -65,16 +93,8 @@ class PlannerNode(Node):
 
         self.cmd_vel_pub = self.create_publisher(
             Twist,
-            '/iplanner_output',
+            '/cmd_vel',
             10
-        )
-
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            '/odom',
-            self.update_odometry,
-            1,
-            callback_group=self.odometry_group
         )
 
         self.control_loop = self.create_timer(1.0 / self.freq_controller, self.controller)
@@ -84,17 +104,20 @@ class PlannerNode(Node):
     def planning(self, msg: DepthGoal):
         try:
             # 🔹 goal
-            goal_x = np.array(msg.goal.x)
-            goal_y = np.array(msg.goal.y)
-            goal = np.stack((goal_x,goal_y,np.zeros_like(goal_x)),axis=1)
-            goal = np.array([msg.goal.x, msg.goal.y], dtype=np.float32)
+            goal_x = np.array([msg.goal.x], dtype=np.float32)  
+            goal_y = np.array([msg.goal.y], dtype=np.float32)
+            goal = np.stack((goal_x, goal_y, np.zeros_like(goal_x)), axis=1)  # shape (N, 3)
             goal = np.clip(goal, -self.goal_range, self.goal_range)
             batch_size = goal.shape[0]
 
-            # 🔹 depth
-            depth = self.bridge.imgmsg_to_cv2(
-                msg.depth, desired_encoding='passthrough'
-            )
+            with self.mutex_pointcloud:
+                pointcloud = self.current_pointcloud
+             
+            if pointcloud is None:
+                self.get_logger().warn('(Planner): No pointcloud detected for planning.')
+                return
+
+            depth = self.pointcloud2_to_depth(pointcloud, self.depth_width, self.depth_height)
             depth = depth.astype(np.float32) / 10000.0
             depth = depth.reshape((batch_size, -1, depth.shape[1], 1))
 
@@ -106,13 +129,26 @@ class PlannerNode(Node):
             all_values_camera = fear.cpu().numpy()
 
             with self.mutex_odom:
-                odom = self.current_odom
+                current_odom = self.current_odom
+       
+            if current_odom is None:
+                self.get_logger().warn('(Planner): No odometry detected for planning.')
+                return
+
+            # position
+            pos = current_odom.pose.pose.position
+            camera_pos = np.array([pos.x, pos.y, pos.z])
+
+            # orientation
+            quat = current_odom.pose.pose.orientation
+            camera_rot = R.from_quat([quat.x, quat.y, quat.z, quat.w]).as_matrix()
+
             # Transform trajectory from camera frame to world frame
             trajectory_points_camera_single = trajectory_points_camera[0]            
             trajectory_points_world = []
             for point in trajectory_points_camera_single:
                 point_local = np.array([point[0], point[1], 0.0])
-                point_world = camera_pos[0] + camera_rot[0] @ point_local
+                point_world = camera_pos + camera_rot @ point_local
                 trajectory_points_world.append(point_world[:2])
             trajectory_points_world = np.array(trajectory_points_world)
             batch_optimal_points_world = trajectory_points_world[None, :, :]  # shape (1, T, 2)
@@ -130,7 +166,7 @@ class PlannerNode(Node):
                 traj_world = []
                 for point in traj_camera:
                     point_local = np.array([point[0], point[1], 0.0])
-                    point_world = camera_pos[0] + camera_rot[0] @ point_local
+                    point_world = camera_pos + camera_rot @ point_local
                     traj_world.append(point_world[:2])
                 all_trajectories_world.append(np.array(traj_world))
 
@@ -152,33 +188,84 @@ class PlannerNode(Node):
 
     
     def controller(self):
-        x0 = np.stack([camera_pos[:,0], camera_pos[:,1], np.arctan2(camera_rot[:,1,0], camera_rot[:,0,0]), [robot_vel], [robot_ang_vel]],axis=-1)
+        with self.mutex_odom:
+            current_odom = self.current_odom
+        
+        if current_odom is None:
+            return
+        # position
+        pos = current_odom.pose.pose.position
+        camera_pos = np.array([pos.x, pos.y, pos.z])
+
+        # orientation
+        quat = current_odom.pose.pose.orientation
+        camera_rot = R.from_quat([quat.x, quat.y, quat.z, quat.w]).as_matrix()
+
+        # velocity
+        robot_vel = current_odom.twist.twist.linear.x
+        robot_ang_vel = current_odom.twist.twist.angular.z
+        
+        x0 = np.array([camera_pos[0], camera_pos[1], np.arctan2(camera_rot[1,0], camera_rot[0,0]), robot_vel, robot_ang_vel])
         
         with self.mutex_planner:
             current_planning = self.planning_output
             mpc = self.mpc
-
-        if current_planning.trajectory_points_world is not None:
-            current_trajectory = current_planning.trajectory_points_world if current_planning.trajectory_points_world is not None else None
-            current_all_trajectories = current_planning.all_trajectories_world if current_planning.all_trajectories_world is not None else None
-            current_all_values = current_planning.all_values_camera if current_planning.all_values_camera is not None else None
         
         if mpc is None:
             return
 
         opt_u_controls, opt_x_states = mpc.solve(x0[:3])
         v, w = opt_u_controls[1, 0], opt_u_controls[1, 1]
+
+        theta = opt_x_states[1, 2]  
+        cmd_vel = Twist()
+        cmd_vel.linear.x = float(v * np.cos(theta))
+        cmd_vel.linear.y = float(v * np.sin(theta))
+        cmd_vel.angular.z = float(w)
+
+        self.cmd_vel_pub.publish(cmd_vel)
     
     def update_odometry(self, odom):
         with self.mutex_odom:
             self.current_odom = odom
 
+    def update_pointcloud(self, pointcloud: PointCloud2):
+        with self.mutex_pointcloud:
+            self.current_pointcloud = pointcloud 
+
+    def pointcloud2_to_depth(self, msg: PointCloud2, width: int, height: int) -> np.ndarray:
+        intrinsic = self.intrinsic  # sua matriz intrínseca
+
+        points_raw = pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
+        points = np.array(list(points_raw), dtype=np.float32)
+
+        if points.shape[0] == 0:
+            return np.zeros((height, width), dtype=np.float32)
+
+        fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+        cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+
+        valid = points[:, 2] > 0
+        points = points[valid]
+
+        u = (fx * points[:, 0] / points[:, 2] + cx).astype(int)
+        v = (fy * points[:, 1] / points[:, 2] + cy).astype(int)
+
+        mask = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+        u, v, z = u[mask], v[mask], points[mask, 2]
+
+        depth_image = np.full((height, width), np.inf, dtype=np.float32)
+        idx = np.argsort(z)
+        depth_image[v[idx], u[idx]] = z[idx]
+        depth_image[depth_image == np.inf] = 0.0
+
+        return depth_image
 
 def main(args=None):
     rclpy.init(args=args)
     node = PlannerNode()
     
-    executor = MultiThreadedExecutor(num_threads=2)
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     executor.spin()
 
