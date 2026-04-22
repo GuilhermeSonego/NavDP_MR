@@ -5,6 +5,9 @@ from rclpy.executors import MultiThreadedExecutor
 
 from iplanner_agent import IPlannerAgent
 from tracking_utils import MPC_Controller
+from visualization_utils import VisualizationManager
+from basic_utils import draw_box_with_text
+
 from my_interfaces.msg import DepthGoal # Tem que colocar a mensagem nova aqui
 from geometry_msgs.msg import Twist
 from scipy.spatial.transform import Rotation as R
@@ -12,8 +15,11 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 
+
 import numpy as np
 import threading
+import imageio
+import cv2
 
 # TODO: Intrinsic e args
 
@@ -37,7 +43,7 @@ class PlannerNode(Node):
         self.declare_parameter('depth_height', 0)
         self.declare_parameter('depth_width', 0)
 
-                self.depth_height = self.get_parameter('depth_height').get_parameter_value().integer_value
+        self.depth_height = self.get_parameter('depth_height').get_parameter_value().integer_value
         self.depth_width = self.get_parameter('depth_width').get_parameter_value().integer_value
 
         self.intrinsic = np.array(self.get_parameter('intrinsic').get_parameter_value().double_array_value)
@@ -64,6 +70,10 @@ class PlannerNode(Node):
         self.goal_range = self.get_parameter('goal_range').get_parameter_value().double_value
         self.speed = self.get_parameter('speed').get_parameter_value().double_value
 
+        save_dir = './trajectories/'
+        self.fps_writer = imageio.get_writer(save_dir + "fps.mp4", fps=10)
+        self.vis_manager = VisualizationManager(history_size=5)
+
         self.odom_sub = self.create_subscription(
             Odometry,
             '/local_position/odom',
@@ -80,7 +90,7 @@ class PlannerNode(Node):
             callback_group = self.pointcloud_group
         )
 
-        self.planner_sub = self.create_subscription(
+        self.goal_input = self.create_subscription(
             DepthGoal,
             '/planner_input',
             self.planning,
@@ -223,7 +233,27 @@ class PlannerNode(Node):
         cmd_vel.angular.z = float(w)
 
         self.cmd_vel_pub.publish(cmd_vel)
-    
+
+        current_trajectory = current_planning.trajectory_points_world
+        current_all_trajectories = current_planning.all_trajectories_world
+        current_all_values = current_planning.all_values_camera
+
+        vis_image = self.vis_manager.visualize_trajectory(
+            images, depths[:,:,None], self.intrinsic,
+            current_trajectory,
+            robot_pose=x0,
+            all_trajectories_points=current_all_trajectories,
+            all_trajectories_values=current_all_values
+        )
+        # Visualization
+        vis_image = draw_box_with_text(vis_image,0,0,430,50,"desired lin.:%.2f ang.:%.2f"%(v,w))
+        vis_image = draw_box_with_text(vis_image,0,50,430,50,"actual lin.:%.2f ang.:%.2f"%(robot_vel,robot_ang_vel))
+        if current_all_values is not None:
+            vis_image = draw_box_with_text(vis_image,0,770,430,50,"critic max:%.2f min:%.2f"%(np.max(current_all_values), np.min(current_all_values)))
+        vis_image = draw_box_with_text(vis_image,0,820,430,50,"point goal:(%.2f, %.2f)"%(goals[0],goals[1]))
+        cv2.imwrite(f"frame_test.png", cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
+        self.fps_writer.append_data(vis_image)
+
     def update_odometry(self, odom):
         with self.mutex_odom:
             self.current_odom = odom
