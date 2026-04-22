@@ -6,14 +6,12 @@ from rclpy.executors import MultiThreadedExecutor
 from iplanner_agent import IPlannerAgent
 from tracking_utils import MPC_Controller
 from my_interfaces.msg import DepthGoal # Tem que colocar a mensagem nova aqui
-from std_msgs.msg import Float32MultiArray
 from geometry_msgs.msg import Twist
 from scipy.spatial.transform import Rotation as R
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 
-from cv_bridge import CvBridge
 import numpy as np
 import threading
 
@@ -30,7 +28,7 @@ class PlannerNode(Node):
     def __init__(self):
         super().__init__('planner_node')
 
-        self.declare_parameter('intrinsic', [0.0, 0.0])
+        self.declare_parameter('intrinsic', [0.0, 0.0, 0.0, 0.0])
         self.declare_parameter('checkpoint', '')
         self.declare_parameter('config', '')
         self.declare_parameter('speed', 0.0)
@@ -39,19 +37,18 @@ class PlannerNode(Node):
         self.declare_parameter('depth_height', 0)
         self.declare_parameter('depth_width', 0)
 
+                self.depth_height = self.get_parameter('depth_height').get_parameter_value().integer_value
+        self.depth_width = self.get_parameter('depth_width').get_parameter_value().integer_value
+
         self.intrinsic = np.array(self.get_parameter('intrinsic').get_parameter_value().double_array_value)
         checkpoint = self.get_parameter('checkpoint').get_parameter_value().string_value
         config = self.get_parameter('config').get_parameter_value().string_value
-
-        self.depth_height = self.get_parameter('depth_height').get_parameter_value().integer_value
-        self.depth_width = self.get_parameter('depth_width').get_parameter_value().integer_value
 
         self.planner = IPlannerAgent(self.intrinsic,
                                     model_path=checkpoint,
                                     model_config_path=config,
                                     device='cuda:0')
 
-        self.bridge = CvBridge()
         self.mutex_planner = threading.Lock() # Planner trajectory mutex
         self.mutex_odom = threading.Lock() # Odometry value mutex
         self.mutex_pointcloud = threading.Lock() # Pointcloud mutex
@@ -118,7 +115,7 @@ class PlannerNode(Node):
                 return
 
             depth = self.pointcloud2_to_depth(pointcloud, self.depth_width, self.depth_height)
-            depth = depth.astype(np.float32) / 10000.0
+            depth = depth.astype(np.float32)
             depth = depth.reshape((batch_size, -1, depth.shape[1], 1))
 
             # 🔹 planner_output
@@ -192,6 +189,7 @@ class PlannerNode(Node):
             current_odom = self.current_odom
         
         if current_odom is None:
+            self.get_logger().warn('(Controller): No odometry detected for control.')
             return
         # position
         pos = current_odom.pose.pose.position
@@ -212,6 +210,7 @@ class PlannerNode(Node):
             mpc = self.mpc
         
         if mpc is None:
+            self.get_logger().warn('(Controller): No MPC detected for control.')
             return
 
         opt_u_controls, opt_x_states = mpc.solve(x0[:3])
