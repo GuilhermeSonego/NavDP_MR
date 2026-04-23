@@ -8,13 +8,15 @@ from tracking_utils import MPC_Controller
 from visualization_utils import VisualizationManager
 from basic_utils import draw_box_with_text
 
-from my_interfaces.msg import DepthGoal # Tem que colocar a mensagem nova aqui
 from geometry_msgs.msg import Twist
 from scipy.spatial.transform import Rotation as R
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, Image
 from sensor_msgs_py import point_cloud2 as pc2
-
+from tf2_ros import Buffer, TransformListener
+from tf2_geometry_msgs import do_transform_point
+from geometry_msgs.msg import PointStamped
+from cv_bridge import CvBridge
 
 import numpy as np
 import threading
@@ -39,7 +41,8 @@ class PlannerNode(Node):
         self.declare_parameter('config', '')
         self.declare_parameter('speed', 0.0)
         self.declare_parameter('goal_range', 0.0)
-        self.declare_parameter('controller_frequency', 30.0)
+        self.declare_parameter('controller_max_frequency', 60.0)
+        self.declare_parameter('planner_max_frequency', 60.0)
         self.declare_parameter('depth_height', 0)
         self.declare_parameter('depth_width', 0)
 
@@ -58,17 +61,32 @@ class PlannerNode(Node):
         self.mutex_planner = threading.Lock() # Planner trajectory mutex
         self.mutex_odom = threading.Lock() # Odometry value mutex
         self.mutex_pointcloud = threading.Lock() # Pointcloud mutex
-        self.freq_controller = self.get_parameter('controller_frequency').get_parameter_value().double_value # Maximum controller frequency in hz
+        self.mutex_goal = threading.Lock() # Current goal mutex
+        self.mutex_image = threading.Lock() # Last image mutex
+        self.freq_controller = self.get_parameter('controller_max_frequency').get_parameter_value().double_value # Maximum controller frequency in hz
+        self.freq_planner = self.get_parameter('planner_max_frequency').get_parameter_value().double_value # Maximum planner frequency in hz
         self.planner_group = MutuallyExclusiveCallbackGroup()
+        self.controller_group = MutuallyExclusiveCallbackGroup()
         self.odometry_group = MutuallyExclusiveCallbackGroup()
         self.pointcloud_group = MutuallyExclusiveCallbackGroup()
+        self.goal_group = MutuallyExclusiveCallbackGroup()
+        self.image_group = MutuallyExclusiveCallbackGroup()
 
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.cv_bridge = CvBridge()
         self.planning_output = PlanningOutput()
         self.mpc = None
+        self.current_goal_world = None
         self.current_odom = None
         self.current_pointcloud = None
+        self.current_image = None
+        self.vis_depth = None
+        self.vis_image = None
+        self.vis_goal = None
         self.goal_range = self.get_parameter('goal_range').get_parameter_value().double_value
         self.speed = self.get_parameter('speed').get_parameter_value().double_value
+
 
         save_dir = './trajectories/'
         self.fps_writer = imageio.get_writer(save_dir + "fps.mp4", fps=10)
@@ -90,12 +108,20 @@ class PlannerNode(Node):
             callback_group = self.pointcloud_group
         )
 
-        self.goal_input = self.create_subscription(
-            DepthGoal,
-            '/planner_input',
-            self.planning,
+        self.image_sub = self.create_subscription(
+            Image,
+            '/camera/image_raw',
+            self.update_image,
             1,
-            callback_group=self.planner_group
+            callback_group=self.image_group
+        )
+
+        self.goal_sub = self.create_subscription(
+            PointStamped,
+            '/waypoint',
+            self.update_goal,
+            1,
+            callback_group=self.goal_group
         )
 
         self.cmd_vel_pub = self.create_publisher(
@@ -104,16 +130,47 @@ class PlannerNode(Node):
             10
         )
 
-        self.control_loop = self.create_timer(1.0 / self.freq_controller, self.controller)
+        self.planner_loop = self.create_timer(
+            1.0 / self.freq_planner,
+            self.planning,
+            callback_group=self.planner_group  
+        )
+
+        self.control_loop = self.create_timer(
+            1.0 / self.freq_controller,
+            self.controller,
+            callback_group=self.controller_group
+        )
 
         self.get_logger().info("Planner node started.")
 
-    def planning(self, msg: DepthGoal):
+    def planning(self):
         try:
-            # 🔹 goal
-            goal_x = np.array([msg.goal.x], dtype=np.float32)  
-            goal_y = np.array([msg.goal.y], dtype=np.float32)
-            goal = np.stack((goal_x, goal_y, np.zeros_like(goal_x)), axis=1)  # shape (N, 3)
+            with self.mutex_goal:
+                goal_world = self.current_goal_world
+
+            if goal_world is None:
+                self.get_logger().warn('(Planner): No goal available.')
+                return
+
+            with self.mutex_odom:
+                current_odom = self.current_odom
+
+            if current_odom is None:
+                self.get_logger().warn('(Planner): No odometry detected for planning.')
+                return
+
+            # transforms goal in world frame to relative to camera frame
+            pos = current_odom.pose.pose.position
+            quat = current_odom.pose.pose.orientation
+            camera_rot = R.from_quat([quat.x, quat.y, quat.z, quat.w]).as_matrix()
+            camera_pos = np.array([pos.x, pos.y, pos.z])
+
+            goal_relative = camera_rot.T @ (np.array([goal_world.x, goal_world.y, goal_world.z]) - camera_pos)
+
+            goal_x = np.array([goal_relative[0]], dtype=np.float32)
+            goal_y = np.array([goal_relative[1]], dtype=np.float32)
+            goal = np.stack((goal_x, goal_y, np.zeros_like(goal_x)), axis=1)
             goal = np.clip(goal, -self.goal_range, self.goal_range)
             batch_size = goal.shape[0]
 
@@ -126,6 +183,7 @@ class PlannerNode(Node):
 
             depth = self.pointcloud2_to_depth(pointcloud, self.depth_width, self.depth_height)
             depth = depth.astype(np.float32)
+            depth_for_vis = depth.copy()
             depth = depth.reshape((batch_size, -1, depth.shape[1], 1))
 
             # 🔹 planner_output
@@ -134,21 +192,6 @@ class PlannerNode(Node):
             trajectory_points_camera = trajectory.cpu().numpy()
             all_trajectories_camera = trajectory.cpu().numpy()[None, :, :, :]
             all_values_camera = fear.cpu().numpy()
-
-            with self.mutex_odom:
-                current_odom = self.current_odom
-       
-            if current_odom is None:
-                self.get_logger().warn('(Planner): No odometry detected for planning.')
-                return
-
-            # position
-            pos = current_odom.pose.pose.position
-            camera_pos = np.array([pos.x, pos.y, pos.z])
-
-            # orientation
-            quat = current_odom.pose.pose.orientation
-            camera_rot = R.from_quat([quat.x, quat.y, quat.z, quat.w]).as_matrix()
 
             # Transform trajectory from camera frame to world frame
             trajectory_points_camera_single = trajectory_points_camera[0]            
@@ -186,9 +229,15 @@ class PlannerNode(Node):
             new_planning_output.all_trajectories_world = batch_all_points_world
             new_planning_output.all_values_camera = all_values_camera
 
+            with self.mutex_image:
+                current_image = self.current_image
+
             with self.mutex_planner:
                 self.planning_output = new_planning_output
                 self.mpc = mpc
+                self.vis_depth = depth_for_vis
+                self.vis_image = current_image
+                self.vis_goal = goal_relative
 
         except Exception as e:
             self.get_logger().error(f"Erro: {e}")
@@ -218,6 +267,9 @@ class PlannerNode(Node):
         with self.mutex_planner:
             current_planning = self.planning_output
             mpc = self.mpc
+            images = self.vis_image
+            depths = self.vis_depth
+            goals = self.vis_goal
         
         if mpc is None:
             self.get_logger().warn('(Controller): No MPC detected for control.')
@@ -238,29 +290,55 @@ class PlannerNode(Node):
         current_all_trajectories = current_planning.all_trajectories_world
         current_all_values = current_planning.all_values_camera
 
-        vis_image = self.vis_manager.visualize_trajectory(
-            images, depths[:,:,None], self.intrinsic,
-            current_trajectory,
-            robot_pose=x0,
-            all_trajectories_points=current_all_trajectories,
-            all_trajectories_values=current_all_values
-        )
-        # Visualization
-        vis_image = draw_box_with_text(vis_image,0,0,430,50,"desired lin.:%.2f ang.:%.2f"%(v,w))
-        vis_image = draw_box_with_text(vis_image,0,50,430,50,"actual lin.:%.2f ang.:%.2f"%(robot_vel,robot_ang_vel))
-        if current_all_values is not None:
-            vis_image = draw_box_with_text(vis_image,0,770,430,50,"critic max:%.2f min:%.2f"%(np.max(current_all_values), np.min(current_all_values)))
-        vis_image = draw_box_with_text(vis_image,0,820,430,50,"point goal:(%.2f, %.2f)"%(goals[0],goals[1]))
-        cv2.imwrite(f"frame_test.png", cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
-        self.fps_writer.append_data(vis_image)
+        if images is None or depths is None or goals is None or current_trajectory is None:
+            return
+
+        try:
+            vis_image = self.vis_manager.visualize_trajectory(
+                images, depths[:,:,None], self.intrinsic,
+                current_trajectory,
+                robot_pose=x0,
+                all_trajectories_points=current_all_trajectories,
+                all_trajectories_values=current_all_values
+            )
+            # Visualization
+            vis_image = draw_box_with_text(vis_image,0,0,430,50,"desired lin.:%.2f ang.:%.2f"%(v,w))
+            vis_image = draw_box_with_text(vis_image,0,50,430,50,"actual lin.:%.2f ang.:%.2f"%(robot_vel,robot_ang_vel))
+            if current_all_values is not None:
+                vis_image = draw_box_with_text(vis_image,0,770,430,50,"critic max:%.2f min:%.2f"%(np.max(current_all_values), np.min(current_all_values)))
+            vis_image = draw_box_with_text(vis_image,0,820,430,50,"point goal:(%.2f, %.2f)"%(goals[0],goals[1]))
+            cv2.imwrite(f"frame_test.png", cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
+            self.fps_writer.append_data(vis_image)
+        except Exception as e:
+            self.get_logger().warn(f'(Controller): Visualization failed: {e}')
 
     def update_odometry(self, odom):
         with self.mutex_odom:
             self.current_odom = odom
 
+    def update_image(self, msg: Image):
+        with self.mutex_image:
+            self.current_image = self.cv_bridge.imgmsg_to_cv2(
+                msg, desired_encoding='rgb8'
+        )
+
     def update_pointcloud(self, pointcloud: PointCloud2):
         with self.mutex_pointcloud:
             self.current_pointcloud = pointcloud 
+
+    def update_goal(self, msg: PointStamped):
+        try:
+            # transforms goal to world frame 
+            transform = self.tf_buffer.lookup_transform(
+                'world',
+                msg.header.frame_id,
+                rclpy.time.Time()
+            )
+            goal_world = do_transform_point(msg, transform)
+            with self.mutex_goal:
+                self.current_goal_world = goal_world.point  
+        except Exception as e:
+            self.get_logger().warn(f'(Goal): TF transform failed: {e}')
 
     def pointcloud2_to_depth(self, msg: PointCloud2, width: int, height: int) -> np.ndarray:
         intrinsic = self.intrinsic  # sua matriz intrínseca
@@ -294,7 +372,7 @@ def main(args=None):
     rclpy.init(args=args)
     node = PlannerNode()
     
-    executor = MultiThreadedExecutor(num_threads=4)
+    executor = MultiThreadedExecutor(num_threads=6)
     executor.add_node(node)
     executor.spin()
 
